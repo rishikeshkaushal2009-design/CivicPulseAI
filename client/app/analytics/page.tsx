@@ -145,53 +145,7 @@ export default function AnalyticsPage() {
         </div>
       </div>
 
-      {/* PREDICTIVE AI CIVIC INSIGHTS (Prompt Requirement #24) */}
-      <div className="p-6 sm:p-8 rounded-3xl bg-white border border-slate-200 shadow-xs space-y-4">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Sparkles className="w-5 h-5 text-indigo-600" />
-            <div>
-              <h2 className="text-base font-bold text-slate-900">
-                Predictive Civic AI Insights & Early Warnings
-              </h2>
-              <p className="text-xs text-slate-500">
-                Pre-emptive failure detection based on historical complaint velocity and seasonal patterns
-              </p>
-            </div>
-          </div>
-          <span className="text-xs font-bold text-indigo-700 bg-indigo-50 px-3 py-1 rounded-full">
-            Active Forecasting Engine
-          </span>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2">
-          {PREDICTIVE_ALERTS.map((alert) => (
-            <div
-              key={alert.id}
-              className={`p-4 rounded-2xl border text-xs space-y-2 flex flex-col justify-between ${alert.color}`}
-            >
-              <div>
-                <div className="flex items-center justify-between font-bold">
-                  <span>{alert.risk}</span>
-                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-white/70">
-                    {alert.probability}
-                  </span>
-                </div>
-                <span className="text-[11px] font-semibold opacity-80 block mt-1">
-                  Location: {alert.ward}
-                </span>
-                <p className="mt-2 text-[11px] leading-relaxed opacity-95">
-                  <strong>Recommended Action:</strong> {alert.recommendation}
-                </p>
-              </div>
-
-              <span className="text-[10px] font-bold uppercase tracking-wider opacity-75 pt-2">
-                Automated Preventative Dispatch Available →
-              </span>
-            </div>
-          ))}
-        </div>
-      </div>
+      
 
       {/* CHARTS ROW 1: Monthly Trend & Category Distribution */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
