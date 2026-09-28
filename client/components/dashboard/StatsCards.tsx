@@ -1,68 +1,134 @@
-import {
-  AlertTriangle,
-  CheckCircle2,
-  MapPin,
-  Trophy,
-} from "lucide-react";
+"use client";
 
-const stats = [
-  {
-    title: "Open Complaints",
-    value: "24",
-    icon: AlertTriangle,
-    color: "text-red-400",
-    bg: "bg-red-500/10",
-  },
-  {
-    title: "Resolved",
-    value: "118",
-    icon: CheckCircle2,
-    color: "text-green-400",
-    bg: "bg-green-500/10",
-  },
-  {
-    title: "Nearby Issues",
-    value: "9",
-    icon: MapPin,
-    color: "text-blue-400",
-    bg: "bg-blue-500/10",
-  },
-  {
-    title: "Civic Score",
-    value: "94%",
-    icon: Trophy,
-    color: "text-yellow-400",
-    bg: "bg-yellow-500/10",
-  },
-];
+import { useEffect, useState } from "react";
+
+type Complaint = {
+  id: string;
+  priority?: string;
+  status?: string;
+};
 
 export default function StatsCards() {
-  return (
-    <section className="mt-8 grid gap-6 md:grid-cols-2 xl:grid-cols-4">
-      {stats.map((item) => {
-        const Icon = item.icon;
+  const [stats, setStats] = useState({
+    total: 0,
+    highPriority: 0,
+    underReview: 0,
+    inProgress: 0,
+    resolved: 0,
+  });
 
-        return (
-          <div
-            key={item.title}
-            className="rounded-2xl border border-slate-800 bg-slate-900/80 p-6 transition hover:-translate-y-1 hover:border-blue-500"
-          >
-            <div
-              className={`mb-4 inline-flex rounded-xl p-3 ${item.bg}`}
-            >
-              <Icon className={`h-6 w-6 ${item.color}`} />
+  const loadStats = () => {
+    try {
+      const complaints: Complaint[] = JSON.parse(
+        localStorage.getItem("civicpulse_complaints") || "[]"
+      );
+
+      setStats({
+        total: complaints.length,
+
+        highPriority: complaints.filter(
+          (complaint) =>
+            complaint.priority?.toLowerCase() === "high"
+        ).length,
+
+        underReview: complaints.filter(
+          (complaint) =>
+            complaint.status?.toLowerCase() === "under review"
+        ).length,
+
+        inProgress: complaints.filter(
+          (complaint) =>
+            complaint.status?.toLowerCase() === "in progress"
+        ).length,
+
+        resolved: complaints.filter(
+          (complaint) =>
+            complaint.status?.toLowerCase() === "resolved"
+        ).length,
+      });
+    } catch (error) {
+      console.error("Failed to load complaint statistics:", error);
+    }
+  };
+
+  useEffect(() => {
+    loadStats();
+
+    const handleStorageChange = () => {
+      loadStats();
+    };
+
+    window.addEventListener("storage", handleStorageChange);
+
+    const interval = setInterval(loadStats, 1000);
+
+    return () => {
+      window.removeEventListener("storage", handleStorageChange);
+      clearInterval(interval);
+    };
+  }, []);
+
+  const cards = [
+    {
+      title: "Total Complaints",
+      value: stats.total,
+      icon: "📋",
+      description: "All submitted complaints",
+    },
+    {
+      title: "High Priority",
+      value: stats.highPriority,
+      icon: "🚨",
+      description: "Require urgent attention",
+    },
+    {
+      title: "Under Review",
+      value: stats.underReview,
+      icon: "🔍",
+      description: "Currently being reviewed",
+    },
+    {
+      title: "In Progress",
+      value: stats.inProgress,
+      icon: "🔧",
+      description: "Work is currently underway",
+    },
+    {
+      title: "Resolved",
+      value: stats.resolved,
+      icon: "✅",
+      description: "Successfully resolved",
+    },
+  ];
+
+  return (
+    <section className="grid gap-5 sm:grid-cols-2 lg:grid-cols-5">
+      {cards.map((card) => (
+        <div
+          key={card.title}
+          className="rounded-2xl border border-slate-800 bg-slate-900/80 p-5 transition hover:-translate-y-1 hover:border-blue-500/50"
+        >
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-sm font-medium text-slate-400">
+                {card.title}
+              </p>
+
+              <p className="mt-3 text-3xl font-bold text-white">
+                {card.value}
+              </p>
             </div>
 
-            <h3 className="text-sm text-slate-400">
-              {item.title}
-            </h3>
-
-            <p className="mt-2 text-4xl font-bold text-white">
-              {item.value}
-            </p>
+            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-500/10 text-xl">
+              {card.icon}
+            </div>
           </div>
-        );
-      })}
+
+          <p className="mt-3 text-xs text-slate-500">
+            {card.description}
+          </p>
+        </div>
+      ))}
     </section>
   );
 }
