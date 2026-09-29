@@ -2,16 +2,21 @@ const express = require("express");
 const cors = require("cors");
 require("dotenv").config();
 
-let GoogleGenAI;
+let GoogleGenAI = null;
+
 try {
   const genaiPkg = require("@google/genai");
   GoogleGenAI = genaiPkg.GoogleGenAI;
-} catch (e) {
-  console.warn("⚠️ @google/genai package not found or failed to load");
+} catch (error) {
+  console.warn("⚠️ @google/genai package could not be loaded.");
 }
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// ============================================================
+// CORS
+// ============================================================
 
 app.use(
   cors({
@@ -19,1045 +24,2297 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: "25mb" }));
+// Allow large base64 images
+app.use(
+  express.json({
+    limit: "25mb",
+  })
+);
 
-// Initialize Gemini Client if key exists
+// ============================================================
+// GEMINI CONFIGURATION
+// ============================================================
+
 let aiClient = null;
+
 if (process.env.GEMINI_API_KEY && GoogleGenAI) {
   try {
     aiClient = new GoogleGenAI({
       apiKey: process.env.GEMINI_API_KEY,
     });
+
     console.log("✅ Gemini AI client initialized");
-  } catch (err) {
-    console.warn("⚠️ Could not initialize GoogleGenAI client:", err.message);
+  } catch (error) {
+    console.error(
+      "❌ Gemini initialization failed:",
+      error?.message || error
+    );
   }
 } else {
-  console.log("ℹ️ Running in Hybrid AI mode with intelligent municipal heuristics fallback");
+  console.warn(
+    "⚠️ GEMINI_API_KEY missing. AI image validation will not work."
+  );
 }
 
 const GEMINI_MODELS = [
-  "gemini-3.8-flash",
-  "gemini-2.5-flash",
-  "gemini-2.0-flash",
-  "gemini-1.5-flash",
+  "gemini-3.8-flash"
 ];
 
-// Helper: Check if complaint is about a genuine municipal defect
-function hasCivicIntent(description = "", category = "") {
-  const text = `${description} ${category}`.toLowerCase();
-  const civicKeywords = [
-    'garbage', 'waste', 'trash', 'dump', 'dumping', 'bin', 'litter', 'refuse', 'debris',
-    'pothole', 'crater', 'road', 'asphalt', 'pavement', 'crack', 'street', 'highway',
-    'light', 'streetlight', 'lamp', 'dark', 'illumination', 'electric', 'wire', 'cable', 'transformer',
-    'drain', 'drainage', 'sewer', 'sewage', 'overflow', 'waterlog', 'culvert', 'flood',
-    'water', 'pipe', 'pipeline', 'leak', 'burst', 'contamination', 'manhole'
-  ];
-  return civicKeywords.some((kw) => text.includes(kw));
+// ============================================================
+// BASIC HELPERS
+// ============================================================
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
-// Helper: Dynamically compute Priority & Severity based on defect characteristics and context
-function determineDynamicPriority(category = "Pothole", description = "", isEmergency = false) {
+function normalizeCategory(category = "") {
+  const value = String(category).trim().toLowerCase();
+
+  if (
+    value.includes("pothole") ||
+    value.includes("road damage") ||
+    value.includes("road")
+  ) {
+    return "Pothole";
+  }
+
+  if (
+    value.includes("garbage") ||
+    value.includes("waste") ||
+    value.includes("dump")
+  ) {
+    return "Garbage";
+  }
+
+  if (
+    value.includes("streetlight") ||
+    value.includes("street light") ||
+    value.includes("street lamp") ||
+    value.includes("light")
+  ) {
+    return "Broken streetlight";
+  }
+
+  if (
+    value.includes("drain") ||
+    value.includes("drainage") ||
+    value.includes("sewage")
+  ) {
+    return "Drainage";
+  }
+
+  if (
+    value.includes("water") ||
+    value.includes("leak") ||
+    value.includes("pipe")
+  ) {
+    return "Water supply";
+  }
+
+  if (value.includes("traffic")) {
+    return "Traffic";
+  }
+
+  return category || "Other";
+}
+
+function categoryMatches(selectedCategory, detectedCategory) {
+  const selected = normalizeCategory(selectedCategory);
+  const detected = normalizeCategory(detectedCategory);
+
+  if (selected === "Other") {
+    return true;
+  }
+
+  if (selected === detected) {
+    return true;
+  }
+
+  if (
+    selected === "Pothole" &&
+    detected === "Pothole"
+  ) {
+    return true;
+  }
+
+  if (
+    selected === "Garbage" &&
+    detected === "Garbage"
+  ) {
+    return true;
+  }
+
+  if (
+    selected === "Drainage" &&
+    detected === "Drainage"
+  ) {
+    return true;
+  }
+
+  if (
+    selected === "Water supply" &&
+    detected === "Water supply"
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+// ============================================================
+// PRIORITY
+// ============================================================
+
+function determinePriority(
+  category = "",
+  description = "",
+  isEmergency = false
+) {
+  const text = `${category} ${description}`.toLowerCase();
+
   if (isEmergency) {
     return {
       priority: "Critical",
       severity: "Critical Hazardous",
       urgency: "Emergency SLA: 4 hours",
-      reason: "Citizen flagged as critical public emergency requiring immediate response.",
+      reason:
+        "Citizen marked this complaint as an emergency requiring immediate attention.",
     };
   }
 
-  const text = `${description} ${category}`.toLowerCase();
-
-  // 1. CRITICAL: Life-threatening, live wire, structural collapse, open manhole
   if (
-    text.includes("live wire") ||
-    text.includes("spark") ||
-    text.includes("shock") ||
-    text.includes("hanging wire") ||
-    text.includes("electric shock") ||
-    text.includes("cave-in") ||
-    text.includes("sinkhole") ||
-    text.includes("burst") ||
     text.includes("accident") ||
-    text.includes("casualty") ||
+    text.includes("injury") ||
     text.includes("hospital") ||
-    text.includes("flooded house") ||
-    text.includes("manhole open") ||
-    text.includes("highway")
+    text.includes("live wire") ||
+    text.includes("electric shock") ||
+    text.includes("open manhole") ||
+    text.includes("sinkhole") ||
+    text.includes("flooded house")
   ) {
     return {
       priority: "Critical",
       severity: "Critical Hazardous",
       urgency: "Emergency SLA: 4 hours",
-      reason: "Severe public safety hazard identified with high probability of casualty or vehicular collision.",
+      reason:
+        "The complaint description indicates a potentially serious public-safety hazard.",
     };
   }
 
-  // 2. HIGH: Major road crater, commercial hub dump, sewage backflow, school/campus area
   if (
-    text.includes("main road") ||
-    text.includes("arterial") ||
-    text.includes("college") ||
-    text.includes("campus") ||
     text.includes("huge") ||
     text.includes("massive") ||
-    text.includes("deep crater") ||
-    text.includes("swerving") ||
-    text.includes("commercial") ||
-    text.includes("market") ||
-    text.includes("overflowing") ||
-    text.includes("stench") ||
-    text.includes("days") ||
+    text.includes("deep") ||
+    text.includes("main road") ||
     text.includes("school") ||
+    text.includes("college") ||
+    text.includes("hospital") ||
     text.includes("heavy traffic") ||
-    text.includes("dump") ||
-    category === "Illegal dumping" ||
-    category === "Sewage"
+    text.includes("overflowing")
   ) {
     return {
       priority: "High",
       severity: "Severe",
       urgency: "Standard SLA: 24 hours",
-      reason: "High public impact defect in active commuter/commercial zone causing health and transit disruption.",
+      reason:
+        "The reported issue may have significant public impact or safety implications.",
     };
   }
 
-  // 3. LOW: Minor cosmetic issues, small dry litter, faded markings, curb upkeep
   if (
     text.includes("minor") ||
     text.includes("small") ||
-    text.includes("little") ||
-    text.includes("dry leaves") ||
-    text.includes("faded") ||
-    text.includes("paint") ||
-    text.includes("slow leak") ||
     text.includes("cosmetic") ||
-    text.includes("side of path")
+    text.includes("faded")
   ) {
     return {
       priority: "Low",
       severity: "Minor",
       urgency: "Maintenance SLA: 5-7 days",
-      reason: "Minor non-hazardous issue scheduled for routine municipal maintenance round.",
+      reason:
+        "The reported issue appears suitable for routine municipal maintenance.",
     };
   }
 
-  // 4. MEDIUM: Standard residential municipal upkeep
   return {
     priority: "Medium",
     severity: "Moderate",
     urgency: "Standard SLA: 48-72 hours",
-    reason: "Standard municipal defect requiring scheduled field technician maintenance.",
+    reason:
+      "The complaint represents a standard municipal issue requiring scheduled attention.",
   };
 }
 
-// Helper: Dynamically compute varying YOLO confidence percentage
-function calculateDynamicYoloConfidence(imageSrc = "", textContext = "") {
-  let hash = 0;
-  const sample = (imageSrc.slice(0, 300) + textContext).trim();
-  for (let i = 0; i < sample.length; i++) {
-    hash = (hash << 5) - hash + sample.charCodeAt(i);
-    hash |= 0;
+// ============================================================
+// DEPARTMENT
+// ============================================================
+
+function getDepartment(category) {
+  switch (normalizeCategory(category)) {
+    case "Pothole":
+      return "Roads & Infrastructure Department";
+
+    case "Garbage":
+      return "Sanitation & Solid Waste Management";
+
+    case "Broken streetlight":
+      return "Electrical & Street Lighting Department";
+
+    case "Drainage":
+      return "Drainage & Sewage Management Department";
+
+    case "Water supply":
+      return "Water Supply Department";
+
+    case "Traffic":
+      return "Traffic Management Department";
+
+    default:
+      return "Citizen Grievance Verification Cell";
   }
-  const normalized = Math.abs(hash % 1000) / 1000;
-
-  // Realistic YOLO object detection range: 88.5% to 96.6%
-  const base = 88.5 + normalized * 7.5;
-  const detailBonus = Math.min(1.2, (textContext.length / 40) * 0.4);
-
-  return Number((base + detailBonus).toFixed(1));
 }
 
-// Helper: Inspect image content or metadata for non-civic rejection
-function evaluateCivicImageRejection(image = "", description = "", category = "") {
-  // If description or category indicates genuine municipal defect, NEVER reject!
-  if (hasCivicIntent(description, category)) {
-    return { isRejected: false, isValidCivicIssue: true };
+// ============================================================
+// IMAGE PARSER
+// ============================================================
+
+function parseImage(image) {
+  if (!image || typeof image !== "string") {
+    return null;
   }
 
-  // Only check remote web URLs, NEVER raw base64 image data!
-  const urlText = typeof image === "string" && !image.startsWith("data:") ? image.toLowerCase() : "";
-  const context = `${description} ${category}`.toLowerCase();
+  let value = image.trim();
 
-  // 1. Personal Selfie / Face Detection
-  if (
-    /\b(selfie|my face|myself|photo of me|picture of me|personal portrait)\b/i.test(context) ||
-    urlText.includes("photo-1534528741775") ||
-    urlText.includes("photo-1544005313")
-  ) {
+  // Handle JSON/string escaping if it somehow reaches the backend
+  value = value.replace(/\\"/g, '"');
+
+  // Expected:
+  // data:image/jpeg;base64,/9j/4AAQ...
+  // data:image/png;base64,iVBOR...
+  // data:image/webp;base64,UklGR...
+
+  const match = value.match(
+    /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.*)$/s
+  );
+
+  if (!match) {
+    console.error("❌ Invalid image data URI");
+    console.error("Image prefix:", value.slice(0, 100));
+
+    return null;
+  }
+
+  const mimeType = match[1].toLowerCase();
+
+  let base64 = match[2].trim();
+
+  // Remove accidental whitespace/newlines
+  base64 = base64.replace(/\s+/g, "");
+
+  // Remove accidental surrounding quotes
+  base64 = base64.replace(/^["']|["']$/g, "");
+
+  // Convert URL-safe Base64 to normal Base64
+  base64 = base64
+    .replace(/-/g, "+")
+    .replace(/_/g, "/");
+
+  // Remove any characters that cannot exist in standard Base64
+  base64 = base64.replace(/[^A-Za-z0-9+/=]/g, "");
+
+  // Validate Base64 length
+  if (base64.length === 0) {
+    console.error("❌ Empty Base64 image data");
+    return null;
+  }
+
+  // Add missing padding if necessary
+  const remainder = base64.length % 4;
+
+  if (remainder === 2) {
+    base64 += "==";
+  } else if (remainder === 3) {
+    base64 += "=";
+  } else if (remainder === 1) {
+    console.error("❌ Invalid Base64 length:", base64.length);
+    return null;
+  }
+
+  // IMPORTANT:
+  // Decode and re-encode using Node's Buffer.
+  // This gives Gemini a canonical Base64 string.
+  try {
+    const buffer = Buffer.from(base64, "base64");
+
+    if (!buffer || buffer.length === 0) {
+      console.error("❌ Base64 decoded to empty buffer");
+      return null;
+    }
+
+    // Verify JPEG/PNG/WEBP signatures when possible
+    const hex = buffer
+      .subarray(0, 12)
+      .toString("hex")
+      .toLowerCase();
+
+    const isJpeg = hex.startsWith("ffd8ff");
+    const isPng = hex.startsWith("89504e47");
+    const isWebp = hex.startsWith("52494646") && hex.includes("57454250");
+
+    console.log("🖼️ Image validation:");
+    console.log("   MIME:", mimeType);
+    console.log("   Bytes:", buffer.length);
+    console.log("   JPEG:", isJpeg);
+    console.log("   PNG:", isPng);
+    console.log("   WEBP:", isWebp);
+
+    if (!isJpeg && !isPng && !isWebp) {
+      console.warn(
+        "⚠️ Image signature was not recognized. Continuing anyway."
+      );
+    }
+
+    // Re-encode to guaranteed valid Base64
+    const normalizedBase64 = buffer.toString("base64");
+
     return {
-      isRejected: true,
-      isValidCivicIssue: false,
-      rejectionReason:
-        "COMPLAINT REJECTED: CivicPulse YOLOv8 Vision detected a personal selfie / human portrait. No municipal infrastructure defect (pothole, waste, broken streetlight, or drainage) was detected. Submissions without valid civic evidence cannot be processed.",
-      rejectedType: "Human Portrait / Personal Selfie",
-      boundingBoxes: [
-        {
-          ymin: 0.15,
-          xmin: 0.25,
-          ymax: 0.85,
-          xmax: 0.75,
-          label: "Rejected: Human Portrait / Selfie",
-          confidence: 0.986,
-          isDefect: false,
-        },
-      ],
+      mimeType,
+      data: normalizedBase64,
     };
-  }
+  } catch (error) {
+    console.error(
+      "❌ Base64 decoding failed:",
+      error?.message || error
+    );
 
-  // 2. Domestic Animal / Pet Detection
-  if (
-    /\b(my pet|my dog|my puppy|my cat|cute dog|cute cat|domestic dog|domestic cat|pet animal)\b/i.test(context) ||
-    urlText.includes("photo-1543466835") ||
-    urlText.includes("photo-1514888286974")
-  ) {
-    return {
-      isRejected: true,
-      isValidCivicIssue: false,
-      rejectionReason:
-        "COMPLAINT REJECTED: CivicPulse YOLOv8 Vision detected a domestic pet / animal. This image does not show municipal infrastructure damage or civic defects.",
-      rejectedType: "Domestic Pet / Animal",
-      boundingBoxes: [
-        {
-          ymin: 0.2,
-          xmin: 0.22,
-          ymax: 0.82,
-          xmax: 0.78,
-          label: "Rejected: Domestic Pet / Animal",
-          confidence: 0.979,
-          isDefect: false,
-        },
-      ],
-    };
+    return null;
   }
-
-  // 3. Food / Dining Dish Detection
-  if (
-    /\b(pizza|burger|sandwich|pasta|salad|delicious food|my lunch|my dinner|food dish|restaurant meal)\b/i.test(context) ||
-    urlText.includes("photo-1565299624946") ||
-    urlText.includes("photo-1504674900247")
-  ) {
-    return {
-      isRejected: true,
-      isValidCivicIssue: false,
-      rejectionReason:
-        "COMPLAINT REJECTED: CivicPulse YOLOv8 Vision detected food items / dining plate. This is irrelevant to municipal civic infrastructure grievances.",
-      rejectedType: "Food / Restaurant Dish",
-      boundingBoxes: [
-        {
-          ymin: 0.22,
-          xmin: 0.18,
-          ymax: 0.78,
-          xmax: 0.82,
-          label: "Rejected: Food / Dining Dish",
-          confidence: 0.965,
-          isDefect: false,
-        },
-      ],
-    };
-  }
-
-  // 4. Indoor Residential / Furniture Detection
-  if (
-    /\b(bedroom|living room|my sofa|my bed|private furniture|indoor wardrobe)\b/i.test(context) ||
-    urlText.includes("photo-1586023492125")
-  ) {
-    return {
-      isRejected: true,
-      isValidCivicIssue: false,
-      rejectionReason:
-        "COMPLAINT REJECTED: CivicPulse YOLOv8 Vision detected indoor residential interior / furniture. Outside municipal public infrastructure jurisdiction.",
-      rejectedType: "Indoor Residential Space",
-      boundingBoxes: [
-        {
-          ymin: 0.12,
-          xmin: 0.12,
-          ymax: 0.88,
-          xmax: 0.88,
-          label: "Rejected: Indoor Residential Interior",
-          confidence: 0.954,
-          isDefect: false,
-        },
-      ],
-    };
-  }
-
-  // 5. Document / Receipt / Text Meme
-  if (/\b(receipt|invoice|tax document|payment bill|homework assignment)\b/i.test(context)) {
-    return {
-      isRejected: true,
-      isValidCivicIssue: false,
-      rejectionReason:
-        "COMPLAINT REJECTED: CivicPulse YOLOv8 Vision detected paper document / receipt / graphic. Photographic proof of outdoor municipal defect required.",
-      rejectedType: "Paper Document / Graphic",
-      boundingBoxes: [
-        {
-          ymin: 0.18,
-          xmin: 0.2,
-          ymax: 0.82,
-          xmax: 0.8,
-          label: "Rejected: Paper Document / Graphic",
-          confidence: 0.971,
-          isDefect: false,
-        },
-      ],
-    };
-  }
-
-  return { isRejected: false, isValidCivicIssue: true };
 }
 
-// Helper: Intelligent YOLO defect detection & classification engine
-function generateYoloCivicAnalysis(description = "", categoryHint = "Pothole", image = "", isEmergency = false) {
-  // First check for non-civic rejection
-  const rejectionCheck = evaluateCivicImageRejection(image, description, categoryHint);
-  if (rejectionCheck.isRejected) {
-    const rejConfidence = calculateDynamicYoloConfidence(image, rejectionCheck.rejectedType || "rejected");
-    return {
-      isValidCivicIssue: false,
-      isRejected: true,
-      rejectionReason: rejectionCheck.rejectionReason,
-      category: "Other",
-      priority: "Low",
-      severity: "Minor",
-      summary: `Image Rejected: ${rejectionCheck.rejectedType} detected. No valid municipal defect identified.`,
-      department: "Citizen Grievance Verification Cell",
-      suggestedAction: "Upload or capture a clear photo of the public civic defect.",
-      reason: rejectionCheck.rejectionReason,
-      estimatedUrgency: "Submission Locked - Evidence verification failed",
-      confidenceScore: rejConfidence,
-      safetyRiskIndex: 0.5,
-      detectedObjects: [rejectionCheck.rejectedType],
-      boundingBoxes: rejectionCheck.boundingBoxes.map(b => ({
-        ...b,
-        confidence: Number((rejConfidence / 100).toFixed(3))
-      })),
-      yoloModelVersion: "CivicPulse YOLOv8-Municipal-v3.2",
-    };
+// ============================================================
+// GEMINI VISION VALIDATION
+// ============================================================
+
+async function analyzeImageWithGemini({
+  image,
+  description,
+  category,
+  location,
+}) {
+  if (!aiClient) {
+    throw new Error(
+      "Gemini AI is not configured. Please set GEMINI_API_KEY in .env."
+    );
   }
 
-  const text = `${description} ${categoryHint}`.toLowerCase();
-  const overallConfidence = calculateDynamicYoloConfidence(image, `${description} ${categoryHint}`);
-  const dynPriority = determineDynamicPriority(categoryHint, description, isEmergency);
+  const imageData = parseImage(image);
+  if (imageData) {
+  console.log("✅ Image successfully parsed");
+  console.log("   MIME:", imageData.mimeType);
+  console.log("   Base64 length:", imageData.data.length);
+}
 
-  // Valid Civic Defect Detection
-  let category = categoryHint || "Pothole";
-  let priority = dynPriority.priority;
-  let severity = dynPriority.severity;
-  let estimatedUrgency = dynPriority.urgency;
-  let reason = dynPriority.reason;
-  let department = "Sanitation & Solid Waste Management";
-  let summary = "Solid waste and uncollected commercial refuse accumulation.";
-  let suggestedAction = "Dispatch hydraulic tipper dumper truck and lime bleaching disinfectant squad.";
-  let detectedObjects = ["Solid Waste Mound", "Plastic Refuse Sacks", "Organic Debris"];
+  if (!imageData) {
+    throw new Error(
+      "Invalid image format. Please upload a valid JPEG, PNG, WEBP or GIF image."
+    );
+  }
+  
 
-  const boxConf1 = Number((overallConfidence / 100).toFixed(3));
-  const boxConf2 = Number(((overallConfidence - 3.2) / 100).toFixed(3));
+  const prompt = `
+You are CivicPulse Vision Validator.
 
-  let boundingBoxes = [
+Your job is to inspect the uploaded citizen photograph and determine whether it actually contains a valid civic/public infrastructure issue.
+
+IMPORTANT RULES:
+
+1. ACTUALLY INSPECT THE IMAGE.
+2. Do NOT trust the selected category.
+3. Do NOT trust the complaint description as proof.
+4. Do NOT assume an image is a pothole just because the user selected "Pothole".
+5. Do NOT invent objects that are not visible.
+6. Do NOT invent bounding boxes.
+7. Do NOT invent confidence values.
+8. Reject unrelated images.
+9. Reject screenshots, logos, posters, random objects, people, animals, food, rooms, computer screens and unrelated photographs.
+10. A valid complaint requires visible evidence of a civic issue.
+
+SELECTED CATEGORY:
+
+${selectedCategory}
+
+COMPLAINT DESCRIPTION:
+
+${description || "Not provided"}
+
+LOCATION:
+
+${location || "Not provided"}
+
+SUPPORTED CIVIC CATEGORIES:
+
+- Pothole
+- Garbage
+- Broken streetlight
+- Drainage
+- Water supply
+- Traffic
+- Other
+
+CATEGORY VALIDATION:
+
+Pothole:
+The image must visibly show road-surface damage such as a pothole, crater, depression, broken pavement or similar road defect.
+
+Garbage:
+The image must visibly show garbage, litter, waste, dumping, overflowing bins or accumulated refuse.
+
+Broken streetlight:
+The image must visibly show a streetlight, lighting pole or damaged public lighting infrastructure.
+
+Drainage:
+The image must visibly show a drain, blocked drain, sewage issue, drainage infrastructure problem or drainage-related waterlogging.
+
+Water supply:
+The image must visibly show a water leak, broken pipe, burst pipe, water infrastructure or another clear public water-supply issue.
+
+Traffic:
+The image must visibly show a traffic-related civic problem.
+
+Other:
+Use only when the image clearly shows a civic issue that does not fit the above categories.
+
+IMPORTANT:
+
+If the selected category is Pothole and the image does NOT visibly show a pothole, reject the complaint.
+
+If the image is unrelated, reject the complaint.
+
+If the defect cannot clearly be seen, reject the complaint.
+
+Return ONLY valid JSON.
+
+For a VALID complaint:
+
+{
+  "isValidCivicIssue": true,
+  "isRejected": false,
+  "detectedCategory": "Pothole",
+  "selectedCategory": "${selectedCategory}",
+  "categoryMatches": true,
+  "confidence": 0.91,
+  "detectedObjects": [
+    "Pothole"
+  ],
+  "reason": "A clearly visible pothole is present on the road surface.",
+  "rejectionReason": "",
+  "severity": "Moderate",
+  "boundingBoxes": [
     {
-      ymin: 0.2,
-      xmin: 0.16,
-      ymax: 0.82,
-      xmax: 0.84,
-      label: "Solid Waste Accumulation (Class B)",
-      confidence: boxConf1,
-      isDefect: true,
-    },
-    {
-      ymin: 0.55,
-      xmin: 0.12,
-      ymax: 0.88,
-      xmax: 0.52,
-      label: "Plastic Garbage Sacks",
-      confidence: boxConf2,
-      isDefect: true,
-    },
-  ];
-
-  if (
-    text.includes("garbage") ||
-    text.includes("waste") ||
-    text.includes("trash") ||
-    text.includes("dump") ||
-    text.includes("bin") ||
-    text.includes("litter") ||
-    categoryHint === "Garbage" ||
-    categoryHint === "Illegal dumping"
-  ) {
-    category = "Garbage";
-    department = "Sanitation & Solid Waste Management";
-    summary = "Solid waste and uncollected commercial refuse accumulation.";
-    suggestedAction = "Dispatch hydraulic tipper dumper truck and lime bleaching disinfectant squad.";
-    detectedObjects = ["Solid Waste Mound", "Commercial Garbage Sacks", "Plastic Debris"];
-    boundingBoxes = [
-      {
-        ymin: 0.22,
-        xmin: 0.16,
-        ymax: 0.82,
-        xmax: 0.84,
-        label: "Solid Waste Accumulation (Class B)",
-        confidence: boxConf1,
-        isDefect: true,
-      },
-      {
-        ymin: 0.58,
-        xmin: 0.12,
-        ymax: 0.9,
-        xmax: 0.5,
-        label: "Commercial Garbage Sacks",
-        confidence: boxConf2,
-        isDefect: true,
-      },
-    ];
-  } else if (
-    text.includes("pothole") ||
-    text.includes("crater") ||
-    text.includes("road") ||
-    text.includes("asphalt") ||
-    categoryHint === "Pothole" ||
-    categoryHint === "Road damage"
-  ) {
-    category = "Pothole";
-    department = "Roads & Infrastructure Department";
-    summary = "Significant asphalt crater identified impacting vehicular traffic flow.";
-    suggestedAction = "Cold mix bituminous patch compaction followed by pneumatic roller seal.";
-    detectedObjects = ["Pothole Crater", "Fractured Asphalt", "Subgrade Cavity"];
-    boundingBoxes = [
-      {
-        ymin: 0.34,
-        xmin: 0.24,
-        ymax: 0.74,
-        xmax: 0.76,
-        label: "Pothole Crater (Class 3)",
-        confidence: boxConf1,
-        isDefect: true,
-      },
-      {
-        ymin: 0.25,
-        xmin: 0.18,
-        ymax: 0.82,
-        xmax: 0.82,
-        label: "Impact Stress Fracture",
-        confidence: boxConf2,
-        isDefect: true,
-      },
-    ];
-  } else if (
-    text.includes("light") ||
-    text.includes("dark") ||
-    text.includes("lamp") ||
-    text.includes("electricity") ||
-    text.includes("wire") ||
-    text.includes("cable") ||
-    categoryHint === "Broken streetlight" ||
-    categoryHint === "Electricity-related civic issue"
-  ) {
-    category = text.includes("wire") || text.includes("cable") ? "Electricity-related civic issue" : "Broken streetlight";
-    department = "Electrical & Street Lighting Department";
-    summary = "Electrical infrastructure failure and illumination deficiency identified.";
-    suggestedAction = "Isolate feeder circuit breaker, test driver transformer, replace luminaire fixture.";
-    detectedObjects = ["Damaged Luminaire", "Exposed Pole Fitting", "Inactive LED Driver"];
-    boundingBoxes = [
-      {
-        ymin: 0.1,
-        xmin: 0.35,
-        ymax: 0.58,
-        xmax: 0.65,
-        label: "Damaged Luminaire / Inactive LED",
-        confidence: boxConf1,
-        isDefect: true,
-      },
-      {
-        ymin: 0.52,
-        xmin: 0.42,
-        ymax: 0.92,
-        xmax: 0.58,
-        label: "Pole Structure & Conduit",
-        confidence: boxConf2,
-        isDefect: true,
-      },
-    ];
-  } else if (
-    text.includes("drain") ||
-    text.includes("sewer") ||
-    text.includes("sewage") ||
-    text.includes("overflow") ||
-    text.includes("waterlog") ||
-    categoryHint === "Drainage" ||
-    categoryHint === "Sewage"
-  ) {
-    category = text.includes("sewage") ? "Sewage" : "Drainage";
-    department = "Drainage & Sewage Management Department";
-    summary = "Stormwater culvert choke causing active surface effluent waterlogging.";
-    suggestedAction = "Deploy high-pressure super-sucker vacuum machine to desilt underground chamber.";
-    detectedObjects = ["Effluent Waterlogging Spill", "Choked Culvert Inflow"];
-    boundingBoxes = [
-      {
-        ymin: 0.38,
-        xmin: 0.15,
-        ymax: 0.85,
-        xmax: 0.88,
-        label: "Effluent Waterlogging Spill",
-        confidence: boxConf1,
-        isDefect: true,
-      },
-      {
-        ymin: 0.25,
-        xmin: 0.3,
-        ymax: 0.55,
-        xmax: 0.7,
-        label: "Choked Culvert Inflow",
-        confidence: boxConf2,
-        isDefect: true,
-      },
-    ];
-  } else if (
-    text.includes("water") ||
-    text.includes("pipe") ||
-    text.includes("leak") ||
-    text.includes("burst") ||
-    categoryHint === "Water supply"
-  ) {
-    category = "Water supply";
-    department = "Water Supply Department";
-    summary = "Pressurized potable water distribution line rupture.";
-    suggestedAction = "Isolate upstream sluice valve, excavate subgrade trench, install sleeve clamp repair.";
-    detectedObjects = ["Pressurized Water Main Leak", "Subgrade Erosion"];
-    boundingBoxes = [
-      {
-        ymin: 0.3,
-        xmin: 0.2,
-        ymax: 0.8,
-        xmax: 0.82,
-        label: "Pressurized Water Main Leak",
-        confidence: boxConf1,
-        isDefect: true,
-      },
-    ];
-  }
-
-  return {
-    isValidCivicIssue: true,
-    isRejected: false,
-    category,
-    priority,
-    severity,
-    summary,
-    reason,
-    department,
-    suggestedAction,
-    estimatedUrgency,
-    confidenceScore: overallConfidence,
-    safetyRiskIndex: priority === "Critical" ? 9.6 : priority === "High" ? 8.2 : priority === "Medium" ? 5.8 : 2.5,
-    detectedObjects,
-    boundingBoxes,
-    yoloModelVersion: "CivicPulse YOLOv8-Municipal-v3.2",
-  };
+      "label": "Pothole",
+      "confidence": 0.91,
+      "ymin": 0.25,
+      "xmin": 0.20,
+      "ymax": 0.75,
+      "xmax": 0.80,
+      "isDefect": true
+    }
+  ]
 }
 
-// Health Check
+For an INVALID complaint:
+
+{
+  "isValidCivicIssue": false,
+  "isRejected": true,
+  "detectedCategory": "Other",
+  "selectedCategory": "${selectedCategory}",
+  "categoryMatches": false,
+  "confidence": 0.95,
+  "detectedObjects": [
+    "Unrelated image"
+  ],
+  "reason": "The uploaded image does not visibly show a valid civic issue.",
+  "rejectionReason": "The uploaded image does not contain a valid ${selectedCategory} civic issue.",
+  "severity": "None",
+  "boundingBoxes": []
+}
+`;
+
+  let lastError = null;
+
+  for (const model of GEMINI_MODELS) {
+    try {
+      console.log(
+        `🤖 Gemini Vision using model: ${model}`
+      );
+      console.log(
+  `📤 Sending ${imageData.mimeType} image to Gemini`
+);
+
+console.log(
+  `📦 Base64 length: ${imageData.data.length}`
+);
+
+  const selectedCategory =
+    normalizeCategory(category);
+
+      const response =
+        await aiClient.models.generateContent({
+          model,
+
+          contents: [
+            {
+              role: "user",
+
+              parts: [
+                {
+                  text: prompt,
+                },
+
+                {
+                  inlineData: {
+                    mimeType:
+                      imageData.mimeType,
+
+                    data:
+                      imageData.data,
+                  },
+                },
+              ],
+            },
+          ],
+
+          config: {
+            responseMimeType:
+              "application/json",
+          },
+        });
+
+      const text =
+        response?.text;
+
+      console.log(
+        "🤖 Gemini raw response:"
+      );
+
+      console.log(text);
+
+      if (
+        !text ||
+        typeof text !== "string"
+      ) {
+        throw new Error(
+          "Gemini returned an empty response."
+        );
+      }
+
+      let cleanText =
+        text.trim();
+
+      if (
+        cleanText.startsWith("```")
+      ) {
+        cleanText =
+          cleanText
+            .replace(
+              /^```json\s*/i,
+              ""
+            )
+            .replace(
+              /^```\s*/i,
+              ""
+            )
+            .replace(
+              /\s*```$/i,
+              ""
+            )
+            .trim();
+      }
+
+      const result =
+        JSON.parse(cleanText);
+
+      /*
+       * Normalize result.
+       */
+
+      result.isValidCivicIssue =
+        result.isValidCivicIssue === true;
+
+      result.isRejected =
+        !result.isValidCivicIssue;
+
+      result.detectedCategory =
+        normalizeCategory(
+          result.detectedCategory ||
+            "Other"
+        );
+
+      result.selectedCategory =
+        selectedCategory;
+
+      result.categoryMatches =
+        categoryMatches(
+          selectedCategory,
+          result.detectedCategory
+        );
+
+      result.confidence =
+        Math.max(
+          0,
+          Math.min(
+            1,
+            Number(
+              result.confidence
+            ) || 0
+          )
+        );
+
+      result.detectedObjects =
+        Array.isArray(
+          result.detectedObjects
+        )
+          ? result.detectedObjects
+          : [];
+
+      result.boundingBoxes =
+        Array.isArray(
+          result.boundingBoxes
+        )
+          ? result.boundingBoxes
+              .filter(
+                (box) =>
+                  box &&
+                  typeof box ===
+                    "object"
+              )
+              .map((box) => ({
+                label: String(
+                  box.label ||
+                    result.detectedCategory
+                ),
+
+                confidence:
+                  Math.max(
+                    0,
+                    Math.min(
+                      1,
+                      Number(
+                        box.confidence
+                      ) ||
+                        result.confidence
+                    )
+                  ),
+
+                ymin: Math.max(
+                  0,
+                  Math.min(
+                    1,
+                    Number(
+                      box.ymin
+                    ) || 0
+                  )
+                ),
+
+                xmin: Math.max(
+                  0,
+                  Math.min(
+                    1,
+                    Number(
+                      box.xmin
+                    ) || 0
+                  )
+                ),
+
+                ymax: Math.max(
+                  0,
+                  Math.min(
+                    1,
+                    Number(
+                      box.ymax
+                    ) || 1
+                  )
+                ),
+
+                xmax: Math.max(
+                  0,
+                  Math.min(
+                    1,
+                    Number(
+                      box.xmax
+                    ) || 1
+                  )
+                ),
+
+                isDefect:
+                  box.isDefect !==
+                  false,
+              }))
+          : [];
+
+      /*
+       * Very important:
+       * Never allow boxes for rejected images.
+       */
+
+      if (
+        result.isRejected
+      ) {
+        result.boundingBoxes =
+          [];
+      }
+
+      /*
+       * If category does not match,
+       * reject the complaint.
+       */
+
+      if (
+        result.isValidCivicIssue &&
+        !result.categoryMatches
+      ) {
+        result.isValidCivicIssue =
+          false;
+
+        result.isRejected =
+          true;
+
+        result.boundingBoxes =
+          [];
+
+        result.rejectionReason =
+          `The image appears to show ${result.detectedCategory}, not ${selectedCategory}.`;
+      }
+
+      console.log(
+        "✅ Gemini Vision parsed result:"
+      );
+
+      console.log(
+        JSON.stringify(
+          result,
+          null,
+          2
+        )
+      );
+
+      return result;
+
+    } catch (error) {
+      lastError = error;
+
+      console.error(
+        `❌ Gemini Vision failed with ${model}:`
+      );
+
+      console.error(
+        error?.message ||
+          error
+      );
+
+      /*
+       * Try the next model.
+       */
+
+      await sleep(1000);
+    }
+  }
+
+  throw (
+    lastError ||
+    new Error(
+      "Gemini Vision analysis failed."
+    )
+  );
+}
+
+// ============================================================
+// HEALTH CHECK
+// ============================================================
+
 app.get("/", (req, res) => {
   res.json({
     success: true,
-    service: "CivicPulse AI YOLO Vision Backend Service",
+    service:
+      "CivicPulse AI Vision Backend Service",
     status: "Operational",
-    version: "3.2.0",
-    geminiConfigured: !!aiClient,
+    version: "5.0.0",
+    geminiConfigured:
+      !!aiClient,
+    visionValidation:
+      "Gemini Vision",
   });
 });
 
-app.get("/api/health", (req, res) => {
-  res.json({
-    success: true,
-    geminiReady: !!aiClient,
-    yoloModel: "CivicPulse YOLOv8-Municipal-v3.2",
-    timestamp: new Date().toISOString(),
-  });
-});
+// ============================================================
+// AI COMPLAINT ANALYSIS
+// ============================================================
 
-// 1. AI Complaint Analysis Endpoint with YOLO Defect & Rejection Intelligence
-app.post("/api/ai/analyze", async (req, res) => {
-  const { description = "", category = "", image = "", location = "", isEmergency = false } = req.body;
+app.post(
+  "/api/ai/analyze",
+  async (req, res) => {
+    try {
+      console.log(
+        "\n========================================"
+      );
 
-  console.log(`📥 AI Analyze Request: "${description.slice(0, 60)}" | Cat: ${category} | HasImage: ${!!image}`);
+      console.log(
+        "📥 AI ANALYSIS REQUEST"
+      );
 
-  // Image is strictly required for YOLO defect prediction
-  if (!image || !image.trim()) {
+      console.log(
+        "========================================"
+      );
+
+      const {
+        description,
+        category,
+        location,
+        image,
+        isEmergency = false,
+      } = req.body;
+
+      /*
+       * Validate description.
+       */
+
+      if (
+        !description ||
+        !String(description).trim()
+      ) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Complaint description is required.",
+        });
+      }
+
+      /*
+       * Validate image.
+       */
+
+      if (!image) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Complaint image is required.",
+        });
+      }
+
+      const selectedCategory =
+        normalizeCategory(
+          category
+        );
+
+      console.log(
+        "📂 Selected category:",
+        selectedCategory
+      );
+
+      console.log(
+        "📍 Location:",
+        location ||
+          "Not provided"
+      );
+
+      console.log(
+        "📝 Description:",
+        description
+      );
+
+      /*
+       * Run Gemini Vision.
+       */
+
+      const visionResult =
+        await analyzeImageWithGemini({
+          image,
+          description,
+          category:
+            selectedCategory,
+          location,
+        });
+
+      /*
+       * REJECT INVALID IMAGE
+       */
+
+      if (
+        !visionResult.isValidCivicIssue ||
+        visionResult.isRejected ||
+        !visionResult.categoryMatches
+      ) {
+        console.log(
+          "❌ COMPLAINT REJECTED"
+        );
+
+        return res.status(422).json({
+          success: false,
+
+          accepted: false,
+
+          rejected: true,
+
+          error:
+            visionResult.rejectionReason ||
+            "The uploaded image does not match the selected civic complaint category.",
+
+          message:
+            visionResult.rejectionReason ||
+            "Please upload a clear image showing the reported civic issue.",
+
+          analysis: {
+            ...visionResult,
+
+            priority:
+              "Rejected",
+
+            department:
+              "Citizen Grievance Verification Cell",
+          },
+        });
+      }
+
+      /*
+       * Calculate priority.
+       */
+
+      const priorityData =
+        determinePriority(
+          selectedCategory,
+          description,
+          isEmergency
+        );
+
+      /*
+       * Department.
+       */
+
+      const department =
+        getDepartment(
+          visionResult.detectedCategory
+        );
+
+      /*
+       * Final accepted analysis.
+       */
+
+      const finalAnalysis = {
+        ...visionResult,
+
+        category:
+          visionResult.detectedCategory,
+
+        priority:
+          priorityData.priority,
+
+        severity:
+          priorityData.severity,
+
+        urgency:
+          priorityData.urgency,
+
+        reason:
+          priorityData.reason,
+
+        department,
+
+        summary:
+          description.length >
+          180
+            ? `${description.substring(
+                0,
+                177
+              )}...`
+            : description,
+
+        location:
+          location ||
+          "Not provided",
+
+        aiValidated: true,
+
+        validationSource:
+          "Gemini Vision",
+
+        validatedAt:
+          new Date().toISOString(),
+      };
+
+      console.log(
+        "✅ COMPLAINT ACCEPTED"
+      );
+
+      return res.json({
+        success: true,
+
+        accepted: true,
+
+        rejected: false,
+
+        analysis:
+          finalAnalysis,
+      });
+
+    } catch (error) {
+  console.error(
+    "❌ AI analysis failed:",
+    error?.message || error
+  );
+
+  const message = error?.message || String(error);
+
+  // Quota / rate limit
+  if (
+    message.includes("429") ||
+    message.includes("RESOURCE_EXHAUSTED") ||
+    message.toLowerCase().includes("quota")
+  ) {
+    return res.status(429).json({
+      success: false,
+      error:
+        "Gemini API quota or rate limit reached. Please try again later.",
+      retryable: true,
+      errorType: "QUOTA_EXCEEDED",
+    });
+  }
+
+  // Invalid API key
+  if (
+    message.includes("API_KEY") ||
+    message.toLowerCase().includes("api key") ||
+    message.includes("UNAUTHENTICATED")
+  ) {
+    return res.status(401).json({
+      success: false,
+      error:
+        "Gemini API key is invalid or missing. Check GEMINI_API_KEY in .env.",
+      retryable: false,
+      errorType: "INVALID_API_KEY",
+    });
+  }
+
+  // Invalid request / Base64 / malformed image
+  if (
+    message.includes("INVALID_ARGUMENT") ||
+    message.includes("Base64 decoding failed") ||
+    message.includes("inline_data.data") ||
+    message.includes("Invalid value")
+  ) {
     return res.status(400).json({
       success: false,
-      error: "Incident photo is required for YOLO AI vision defect detection.",
-      requiresPhoto: true,
+      error:
+        "Gemini rejected the image data. The uploaded Base64 image is invalid or malformed.",
+      details: message,
+      retryable: false,
+      errorType: "INVALID_IMAGE_DATA",
     });
   }
 
-  const rejectionCheck = evaluateCivicImageRejection(image, description, category);
-  if (rejectionCheck.isRejected) {
-    console.log(`⛔ Image Rejected: ${rejectionCheck.rejectionReason}`);
-    const result = generateYoloCivicAnalysis(description, category, image, isEmergency);
-    return res.json({
-      success: true,
-      analysis: result,
-      source: "CivicPulse YOLOv8 Vision Filter (Defect Non-Compliance)",
+  // Model not available
+  if (
+    message.includes("NOT_FOUND") ||
+    message.includes("not found") ||
+    message.includes("not available")
+  ) {
+    return res.status(404).json({
+      success: false,
+      error:
+        "The configured Gemini model is unavailable for this API project.",
+      details: message,
+      retryable: false,
+      errorType: "MODEL_NOT_AVAILABLE",
     });
   }
 
-  // Graceful, ultra-accurate YOLO classifier
-  const fallbackResult = generateYoloCivicAnalysis(description, category, image, isEmergency);
-  return res.json({
-    success: true,
-    analysis: fallbackResult,
-    source: "CivicPulse YOLOv8 Municipal Vision Engine",
-  });
-});
-
-// 2. Direct YOLO Object Detection Endpoint
-app.post("/api/ai/yolo-detect", (req, res) => {
-  const { image = "", description = "", category = "Pothole", isEmergency = false } = req.body;
-  const analysis = generateYoloCivicAnalysis(description, category, image, isEmergency);
-  res.json({
-    success: true,
-    yolo: analysis,
-  });
-});
-
-// 3. AI Duplicate Detection Endpoint
-app.post("/api/ai/duplicate-check", (req, res) => {
-  const { category, title, description, latitude, longitude } = req.body;
-  res.json({
-    success: true,
-    isDuplicatePossible: false,
-    confidenceScore: 12.5,
-  });
-});
-
-// 4. AI Work Completion Verification Endpoint
-app.post("/api/ai/verify-work", (req, res) => {
-  const { beforePhotoUrl, afterPhotoUrl, description } = req.body;
-  res.json({
-    success: true,
-    verification: {
-      verified: true,
-      aiVerificationScore: 96.4,
-      summary: "AI Computer Vision confirms successful defect mitigation and restored municipal surface.",
-      timestamp: new Date().toISOString(),
-    },
-  });
-});
-
-// ========================================================
-// 5. CIVICPULSE ADMIN & REVENUE ENGINE (BACKEND API)
-// 3 Revenue Streams:
-// 1. Primary: Govt SaaS App Management Retainers
-// 2. Secondary: Worker-Govt Nominal Payout Transaction Fees (5%)
-// 3. Third: Public Infrastructure Tender Admin Cut (2.5%)
-// ========================================================
-
-const INITIAL_ADMIN_CONTRACTS = [
-  {
-    id: "PMC-2025-SAAS-01",
-    municipalityName: "Pune Municipal Corporation (PMC)",
-    contractTier: "Tier 1 Metro",
-    annualValue: 3000000,
-    awardedAuthority: "PMC Central Municipal IT & Public Works",
-    adminCommissionPercent: 2.5,
-    startDate: "2025-04-01",
-    renewalDate: "2026-03-31",
-    status: "Active",
-    serviceScope: [
-      "AI Multimodal YOLO Defect Detection",
-      "Automated Ward Ticket Routing",
-      "Citizen Emergency 4h SLA Escalations",
-      "Worker Guild Escrow Payout Management"
-    ]
-  },
-  {
-    id: "PCMC-2025-SMART-04",
-    municipalityName: "Pimpri-Chinchwad Smart City Ltd (PCMC)",
-    contractTier: "Smart City District",
-    annualValue: 2160000,
-    awardedAuthority: "PCMC Smart City SPV Development Board",
-    adminCommissionPercent: 2.5,
-    startDate: "2025-06-01",
-    renewalDate: "2026-05-31",
-    status: "Active",
-    serviceScope: [
-      "Predictive Civic Hotspots Telemetry",
-      "Public Capital Project Funds Audit",
-      "Contractor Milestone Verification"
-    ]
-  },
-  {
-    id: "BBMP-2026-PILOT-09",
-    municipalityName: "Bruhat Bengaluru Mahanagara Palike (BBMP)",
-    contractTier: "Tier 1 Metro",
-    annualValue: 1800000,
-    awardedAuthority: "BBMP Urban Infrastructure Task Force",
-    adminCommissionPercent: 3.0,
-    startDate: "2026-01-01",
-    renewalDate: "2026-12-31",
-    status: "Under Renewal",
-    serviceScope: [
-      "Flood & Drain Choke Radar",
-      "Road Craters & Bitumen Audit"
-    ]
+  // Gemini temporarily unavailable
+  if (
+    message.includes("503") ||
+    message.includes("UNAVAILABLE")
+  ) {
+    return res.status(503).json({
+      success: false,
+      error:
+        "Gemini is temporarily unavailable. Please try again.",
+      retryable: true,
+      errorType: "GEMINI_UNAVAILABLE",
+    });
   }
-];
 
-const INITIAL_TRANSACTIONS = [
+  return res.status(500).json({
+    success: false,
+    error:
+      message || "AI image validation failed.",
+    retryable: true,
+    errorType: "UNKNOWN_GEMINI_ERROR",
+  });
+}
+  }
+);
+
+// ============================================================
+// /analyze COMPATIBILITY ROUTE
+// ============================================================
+
+app.post(
+  "/analyze",
+  async (req, res) => {
+    /*
+     * Some older frontend versions may call /analyze.
+     *
+     * Forward the same request internally by duplicating
+     * the request URL.
+     */
+
+    req.url =
+      "/api/ai/analyze";
+
+    app.handle(
+      req,
+      res
+    );
+  }
+);
+
+// ============================================================
+// DUPLICATE COMPLAINT CHECK
+// ============================================================
+
+app.post(
+  "/api/ai/duplicate-check",
+  async (req, res) => {
+    try {
+      const {
+        description,
+        category,
+        location,
+        existingComplaints = [],
+      } = req.body;
+
+      if (
+        !description ||
+        !String(description).trim()
+      ) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Complaint description is required.",
+        });
+      }
+
+      /*
+       * First perform local similarity checks.
+       */
+
+      const newText =
+        `${description} ${location || ""}`
+          .toLowerCase()
+          .replace(
+            /[^a-z0-9\s]/g,
+            " "
+          )
+          .replace(
+            /\s+/g,
+            " "
+          )
+          .trim();
+
+      const newWords =
+        new Set(
+          newText
+            .split(" ")
+            .filter(
+              (word) =>
+                word.length > 2
+            )
+        );
+
+      const candidates =
+        Array.isArray(
+          existingComplaints
+        )
+          ? existingComplaints
+          : [];
+
+      let bestMatch =
+        null;
+
+      let bestScore = 0;
+
+      for (
+        const complaint of candidates
+      ) {
+        const oldText =
+          `${complaint.description || ""} ${
+            complaint.location || ""
+          }`
+            .toLowerCase()
+            .replace(
+              /[^a-z0-9\s]/g,
+              " "
+            )
+            .replace(
+              /\s+/g,
+              " "
+            )
+            .trim();
+
+        const oldWords =
+          new Set(
+            oldText
+              .split(" ")
+              .filter(
+                (word) =>
+                  word.length > 2
+              )
+          );
+
+        if (
+          !newWords.size ||
+          !oldWords.size
+        ) {
+          continue;
+        }
+
+        let common = 0;
+
+        for (
+          const word of newWords
+        ) {
+          if (
+            oldWords.has(word)
+          ) {
+            common++;
+          }
+        }
+
+        const union =
+          new Set([
+            ...newWords,
+            ...oldWords,
+          ]).size;
+
+        const score =
+          union > 0
+            ? common / union
+            : 0;
+
+        if (
+          score > bestScore
+        ) {
+          bestScore =
+            score;
+
+          bestMatch =
+            complaint;
+        }
+      }
+
+      const isDuplicate =
+        bestScore >= 0.55;
+
+      return res.json({
+        success: true,
+
+        isDuplicate,
+
+        duplicate:
+          isDuplicate,
+
+        confidence:
+          Number(
+            bestScore.toFixed(
+              3
+            )
+          ),
+
+        match:
+          isDuplicate
+            ? bestMatch
+            : null,
+
+        message:
+          isDuplicate
+            ? "A similar complaint already exists."
+            : "No strong duplicate complaint was found.",
+      });
+
+    } catch (error) {
+      console.error(
+        "❌ Duplicate check failed:",
+        error?.message ||
+          error
+      );
+
+      return res.status(500).json({
+        success: false,
+
+        error:
+          error?.message ||
+          "Duplicate complaint check failed.",
+      });
+    }
+  }
+);
+
+// ============================================================
+// YOLO / VISION DETECTION COMPATIBILITY ENDPOINT
+// ============================================================
+
+app.post(
+  "/api/ai/yolo-detect",
+  async (req, res) => {
+    try {
+      const {
+        image,
+        category,
+        description,
+        location,
+      } = req.body;
+
+      if (!image) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Image is required.",
+        });
+      }
+
+      const result =
+        await analyzeImageWithGemini({
+          image,
+          description,
+          category,
+          location,
+        });
+
+      return res.json({
+        success: true,
+
+        detected:
+          result.isValidCivicIssue,
+
+        isValidCivicIssue:
+          result.isValidCivicIssue,
+
+        category:
+          result.detectedCategory,
+
+        confidence:
+          result.confidence,
+
+        objects:
+          result.detectedObjects,
+
+        boundingBoxes:
+          result.boundingBoxes,
+
+        analysis:
+          result,
+      });
+
+    } catch (error) {
+      console.error(
+        "❌ Vision detection failed:",
+        error?.message ||
+          error
+      );
+
+      return res.status(500).json({
+        success: false,
+
+        error:
+          error?.message ||
+          "Vision detection failed.",
+      });
+    }
+  }
+);
+
+// ============================================================
+// WORK VERIFICATION
+// ============================================================
+
+app.post(
+  "/api/ai/verify-work",
+  async (req, res) => {
+    try {
+      const {
+        beforeImage,
+        afterImage,
+        category,
+        description,
+      } = req.body;
+
+      if (
+        !beforeImage ||
+        !afterImage
+      ) {
+        return res.status(400).json({
+          success: false,
+
+          error:
+            "Before and after images are required.",
+        });
+      }
+
+      /*
+       * Validate the after image.
+       */
+
+      const afterResult =
+        await analyzeImageWithGemini({
+          image: afterImage,
+          description:
+            description ||
+            "Verify completion of municipal work.",
+          category:
+            category || "Other",
+          location:
+            "Not provided",
+        });
+
+      /*
+       * For demonstration purposes,
+       * compare whether the after image still
+       * visibly contains the reported defect.
+       */
+
+      const workCompleted =
+        !afterResult.isValidCivicIssue;
+
+      return res.json({
+        success: true,
+
+        verified:
+          workCompleted,
+
+        workCompleted,
+
+        confidence:
+          workCompleted
+            ? 0.85
+            : 0.35,
+
+        message:
+          workCompleted
+            ? "AI verification indicates that the reported issue may have been resolved."
+            : "The reported issue may still be visible in the after image.",
+
+        afterAnalysis:
+          afterResult,
+      });
+
+    } catch (error) {
+      console.error(
+        "❌ Work verification failed:",
+        error?.message ||
+          error
+      );
+
+      return res.status(500).json({
+        success: false,
+
+        error:
+          error?.message ||
+          "Work verification failed.",
+      });
+    }
+  }
+);
+
+// ============================================================
+// ADMIN / REVENUE DEMO DATA
+// ============================================================
+
+let adminTransactions = [
   {
-    id: "TXN-CP-1001",
-    type: "Govt SaaS Management",
+    id: "TXN-CP-100001",
+    type:
+      "Govt SaaS Management",
     stream: "primary",
-    description: "Municipal SaaS Platform & AI Management Retainer (Q1 2026)",
-    amount: 250000,
-    grossAmount: 250000,
-    adminCutPercent: 100,
-    payer: "Pune Municipal Corporation (PMC)",
-    payee: "CivicPulse AI Technologies",
-    paymentMethod: "PFMS Treasury Direct Debit",
-    transactionRef: "PFMS/PMC/2026/0894218",
-    invoiceId: "INV-CP-2026-001",
-    date: new Date(Date.now() - 1000 * 60 * 60 * 24 * 5).toISOString(),
-    status: "Settled",
-  },
-  {
-    id: "TXN-CP-1002",
-    type: "Govt SaaS Management",
-    stream: "primary",
-    description: "Smart City App Management & SLA Escalation Retainer",
-    amount: 180000,
-    grossAmount: 180000,
-    adminCutPercent: 100,
-    payer: "Pimpri-Chinchwad Municipal Corp (PCMC)",
-    payee: "CivicPulse AI Technologies",
-    paymentMethod: "PFMS Treasury Direct Debit",
-    transactionRef: "PFMS/PCMC/2026/0431201",
-    invoiceId: "INV-CP-2026-002",
-    date: new Date(Date.now() - 1000 * 60 * 60 * 24 * 3).toISOString(),
-    status: "Settled",
-  },
-  {
-    id: "TXN-CP-1003",
-    type: "Contract Authority Commission",
-    stream: "contract_cut",
-    description: "Ward 12 Road Resurfacing Tender (2.5% Admin Commission)",
-    amount: 62500,
+    description:
+      "Annual CivicPulse AI municipal platform management retainer",
+    amount: 2500000,
     grossAmount: 2500000,
-    adminCutPercent: 2.5,
-    payer: "PMC Roads & Infrastructure Department",
-    payee: "M/S Larsen Infra Ltd (Awarded Authority)",
-    paymentMethod: "Treasury Project Escrow Account",
-    transactionRef: "PFMS/TENDER/2026/092144",
-    invoiceId: "INV-CP-2026-003",
-    date: new Date(Date.now() - 1000 * 60 * 60 * 24 * 2).toISOString(),
-    status: "Settled",
-  },
-  {
-    id: "TXN-CP-1004",
-    type: "Contract Authority Commission",
-    stream: "contract_cut",
-    description: "Smart Stormwater Culvert Modernization (2.5% Admin Commission)",
-    amount: 45000,
-    grossAmount: 1800000,
-    adminCutPercent: 2.5,
-    payer: "Smart City Development SPV",
-    payee: "Pune Civil Engineering Works Ltd",
-    paymentMethod: "Treasury Project Escrow Account",
-    transactionRef: "PFMS/TENDER/2026/054329",
-    invoiceId: "INV-CP-2026-004",
-    date: new Date(Date.now() - 1000 * 60 * 60 * 24 * 1).toISOString(),
-    status: "Settled",
-  },
-  {
-    id: "TXN-CP-1005",
-    type: "Worker Transaction Fee",
-    stream: "secondary",
-    description: "Work Order Settlement #CP-99842101 (5% Platform Fee)",
-    amount: 200,
-    grossAmount: 4000,
-    adminCutPercent: 5.0,
-    payer: "Pune Municipal Corporation (Govt Escrow)",
-    payee: "Technician Utsav Kumar (Worker Guild)",
-    paymentMethod: "CivicPulse Automated Worker Escrow Payout",
-    transactionRef: "UTR-HDFC-994821034",
-    invoiceId: "INV-CP-2026-005",
-    date: new Date(Date.now() - 1000 * 60 * 60 * 6).toISOString(),
-    status: "Settled",
-  },
-  {
-    id: "TXN-CP-1006",
-    type: "Worker Transaction Fee",
-    stream: "secondary",
-    description: "Work Order Settlement #CP-88412092 (5% Platform Fee)",
-    amount: 350,
-    grossAmount: 7000,
-    adminCutPercent: 5.0,
-    payer: "Pune Municipal Corporation (Govt Escrow)",
-    payee: "Technician Ramesh Pawar (Worker Guild)",
-    paymentMethod: "CivicPulse Automated Worker Escrow Payout",
-    transactionRef: "UTR-SBI-443921849",
-    invoiceId: "INV-CP-2026-006",
-    date: new Date(Date.now() - 1000 * 60 * 60 * 2).toISOString(),
+    adminCutPercent: 100,
+    payer:
+      "Municipal Corporation",
+    payee:
+      "CivicPulse AI Technologies",
+    paymentMethod:
+      "Government Treasury",
+    transactionRef:
+      "PFMS/IN/2026/100001",
+    invoiceId:
+      "INV-CP-2026-1001",
+    date:
+      new Date().toISOString(),
     status: "Settled",
   },
 ];
 
-let adminContracts = [...INITIAL_ADMIN_CONTRACTS];
-let adminTransactions = [...INITIAL_TRANSACTIONS];
+let adminContracts = [
+  {
+    id: "CON-CP-1001",
+    municipalityName:
+      "Municipal Corporation",
+    contractTier:
+      "Municipal Corporation",
+    annualValue: 2500000,
+    awardedAuthority:
+      "Public Works Division",
+    adminCommissionPercent: 2.5,
+    startDate:
+      new Date()
+        .toISOString()
+        .split("T")[0],
+    renewalDate:
+      new Date(
+        new Date().getFullYear() + 1,
+        new Date().getMonth(),
+        new Date().getDate()
+      )
+        .toISOString()
+        .split("T")[0],
+    status: "Active",
+    serviceScope: [
+      "Infrastructure Upkeep",
+      "AI Quality Auditing",
+    ],
+  },
+];
+
+const INITIAL_TRANSACTIONS =
+  JSON.parse(
+    JSON.stringify(
+      adminTransactions
+    )
+  );
+
+const INITIAL_ADMIN_CONTRACTS =
+  JSON.parse(
+    JSON.stringify(
+      adminContracts
+    )
+  );
+
+// ============================================================
+// ADMIN REVENUE SUMMARY
+// ============================================================
 
 function computeAdminRevenueSummary() {
-  const primarySaaS = adminTransactions
-    .filter((t) => t.stream === "primary" || t.type === "Govt SaaS Management" || t.type === "Govt Contract")
-    .reduce((sum, t) => sum + (t.amount || 0), 0);
+  const primarySaaS =
+    adminTransactions
+      .filter(
+        (t) =>
+          t.stream ===
+            "primary" ||
+          t.type ===
+            "Govt SaaS Management"
+      )
+      .reduce(
+        (sum, t) =>
+          sum +
+          (t.amount || 0),
+        0
+      );
 
-  const secondaryFees = adminTransactions
-    .filter((t) => t.stream === "secondary" || t.type === "Worker Transaction Fee" || t.type === "Service Management Fee")
-    .reduce((sum, t) => sum + (t.amount || 0), 0);
+  const secondaryFees =
+    adminTransactions
+      .filter(
+        (t) =>
+          t.stream ===
+            "secondary" ||
+          t.type ===
+            "Worker Transaction Fee"
+      )
+      .reduce(
+        (sum, t) =>
+          sum +
+          (t.amount || 0),
+        0
+      );
 
-  const contractCommission = adminTransactions
-    .filter((t) => t.stream === "contract_cut" || t.type === "Contract Authority Commission")
-    .reduce((sum, t) => sum + (t.amount || 0), 0);
+  const contractCommission =
+    adminTransactions
+      .filter(
+        (t) =>
+          t.stream ===
+            "contract_cut" ||
+          t.type ===
+            "Contract Authority Commission"
+      )
+      .reduce(
+        (sum, t) =>
+          sum +
+          (t.amount || 0),
+        0
+      );
 
-  const totalRevenue = primarySaaS + secondaryFees + contractCommission;
-  const totalGrossVolume = adminTransactions.reduce((sum, t) => sum + (t.grossAmount || t.amount || 0), 0);
+  const totalRevenue =
+    primarySaaS +
+    secondaryFees +
+    contractCommission;
+
+  const totalGrossVolume =
+    adminTransactions.reduce(
+      (sum, t) =>
+        sum +
+        (t.grossAmount ||
+          t.amount ||
+          0),
+      0
+    );
 
   return {
     totalRevenue,
+
     primarySaaS,
+
     secondaryFees,
+
     contractCommission,
+
     totalGrossVolume,
-    transactionCount: adminTransactions.length,
-    activeContractCount: adminContracts.length,
-    projectedARR: 20500000, // ₹2.05 Cr / yr
+
+    transactionCount:
+      adminTransactions.length,
+
+    activeContractCount:
+      adminContracts.length,
+
+    projectedARR: 20500000,
+
     streamsBreakdown: [
       {
         stream: "primary",
-        name: "Government App Management Retainer",
-        description: "Direct municipal subscription fee charged to government for managing the CivicPulse AI app.",
-        revenue: primarySaaS,
-        percentage: totalRevenue > 0 ? Number(((primarySaaS / totalRevenue) * 100).toFixed(1)) : 0,
-        model: "Fixed SLA Retainer (₹1.5L - ₹3.5L / mo per Urban Local Body)"
+
+        name:
+          "Government App Management Retainer",
+
+        description:
+          "Direct municipal subscription fee for CivicPulse AI platform management.",
+
+        revenue:
+          primarySaaS,
+
+        percentage:
+          totalRevenue > 0
+            ? Number(
+                (
+                  (primarySaaS /
+                    totalRevenue) *
+                  100
+                ).toFixed(1)
+              )
+            : 0,
+
+        model:
+          "Fixed SLA Retainer",
       },
+
       {
         stream: "secondary",
-        name: "Worker Payout Facilitation Nominal Fee",
-        description: "Nominal 5% transaction processing fee charged on every payout between government and verified workers.",
-        revenue: secondaryFees,
-        percentage: totalRevenue > 0 ? Number(((secondaryFees / totalRevenue) * 100).toFixed(1)) : 0,
-        model: "5% Nominal Fee per verified job completion payout"
+
+        name:
+          "Worker Payout Facilitation Fee",
+
+        description:
+          "Platform transaction fee for verified worker payouts.",
+
+        revenue:
+          secondaryFees,
+
+        percentage:
+          totalRevenue > 0
+            ? Number(
+                (
+                  (secondaryFees /
+                    totalRevenue) *
+                  100
+                ).toFixed(1)
+              )
+            : 0,
+
+        model:
+          "Transaction Facilitation",
       },
+
       {
-        stream: "contract_cut",
-        name: "Contract Authority Commission",
-        description: "Admin percentage (2.5%) charged on every infrastructure contract/tender awarded by government to contractor authorities.",
-        revenue: contractCommission,
-        percentage: totalRevenue > 0 ? Number(((contractCommission / totalRevenue) * 100).toFixed(1)) : 0,
-        model: "2.5% Admin Commission on all awarded public works tenders"
-      }
-    ]
+        stream:
+          "contract_cut",
+
+        name:
+          "Contract Authority Commission",
+
+        description:
+          "Administrative commission associated with public works contracts.",
+
+        revenue:
+          contractCommission,
+
+        percentage:
+          totalRevenue > 0
+            ? Number(
+                (
+                  (contractCommission /
+                    totalRevenue) *
+                  100
+                ).toFixed(1)
+              )
+            : 0,
+
+        model:
+          "Contract Administration",
+      },
+    ],
   };
 }
 
-// 5A. GET Admin Revenue Overview
-app.get("/api/admin/revenue", (req, res) => {
-  res.json({
-    success: true,
-    summary: computeAdminRevenueSummary(),
-    contracts: adminContracts,
-    recentTransactions: adminTransactions.slice(0, 15),
-    serverTimestamp: new Date().toISOString(),
-  });
-});
+// ============================================================
+// ADMIN REVENUE
+// ============================================================
 
-// 5B. GET Admin Transactions List
-app.get("/api/admin/transactions", (req, res) => {
-  res.json({
-    success: true,
-    transactions: adminTransactions,
-    count: adminTransactions.length,
-  });
-});
+app.get(
+  "/api/admin/revenue",
+  (req, res) => {
+    res.json({
+      success: true,
 
-// 5C. GET Admin Contracts List
-app.get("/api/admin/contracts", (req, res) => {
-  res.json({
-    success: true,
-    contracts: adminContracts,
-    count: adminContracts.length,
-  });
-});
+      summary:
+        computeAdminRevenueSummary(),
 
-// 5D. POST Simulate / Process a Fake Payment Transaction
-app.post("/api/admin/simulate-payment", (req, res) => {
-  const {
-    streamType = "primary",
-    grossAmount = 50000,
-    payer = "Pune Municipal Corporation (PMC)",
-    payee = "CivicPulse AI Technologies",
-    description = "",
-    paymentMethod = "PFMS Treasury Direct Debit",
-    customPercent,
-    authorityName = "PMC Public Works Authority",
-  } = req.body;
+      contracts:
+        adminContracts,
 
-  const numGross = Math.max(100, Number(grossAmount) || 50000);
-  let civicPulseEarnings = 0;
-  let adminCutPercent = 0;
-  let type = "Govt SaaS Management";
-  let stream = streamType;
-  let desc = description;
+      recentTransactions:
+        adminTransactions.slice(
+          0,
+          15
+        ),
 
-  if (streamType === "primary") {
-    type = "Govt SaaS Management";
-    stream = "primary";
-    adminCutPercent = 100;
-    civicPulseEarnings = numGross;
-    desc = desc || `Municipal App Management & SaaS SLA Retainer (${payer})`;
-  } else if (streamType === "secondary") {
-    type = "Worker Transaction Fee";
-    stream = "secondary";
-    adminCutPercent = Number(customPercent) || 5.0;
-    civicPulseEarnings = Math.round(numGross * (adminCutPercent / 100));
-    desc = desc || `Worker Job Completion Payout (${adminCutPercent}% Platform Facilitation Fee)`;
-  } else if (streamType === "contract_cut") {
-    type = "Contract Authority Commission";
-    stream = "contract_cut";
-    adminCutPercent = Number(customPercent) || 2.5;
-    civicPulseEarnings = Math.round(numGross * (adminCutPercent / 100));
-    desc = desc || `Tender Award Commission: ${authorityName} (${adminCutPercent}% Admin Cut)`;
+      serverTimestamp:
+        new Date().toISOString(),
+    });
   }
+);
 
-  const transactionRef = `PFMS/IN/${new Date().getFullYear()}/${Math.floor(100000 + Math.random() * 900000)}`;
-  const invoiceId = `INV-CP-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`;
-  const id = `TXN-CP-${Date.now().toString().slice(-6)}`;
-  const date = new Date().toISOString();
+// ============================================================
+// ADMIN TRANSACTIONS
+// ============================================================
 
-  const newTxn = {
-    id,
-    type,
-    stream,
-    description: desc,
-    amount: civicPulseEarnings,
-    grossAmount: numGross,
-    adminCutPercent,
-    payer,
-    payee,
-    paymentMethod,
-    transactionRef,
-    invoiceId,
-    date,
-    status: "Settled",
-  };
+app.get(
+  "/api/admin/transactions",
+  (req, res) => {
+    res.json({
+      success: true,
 
-  adminTransactions.unshift(newTxn);
+      transactions:
+        adminTransactions,
 
-  console.log(`💰 Simulated Payment Processed: ${id} | Stream: ${stream} | Earned: ₹${civicPulseEarnings.toLocaleString()} (Gross: ₹${numGross.toLocaleString()})`);
+      count:
+        adminTransactions.length,
+    });
+  }
+);
 
-  res.json({
-    success: true,
-    message: "Payment successfully simulated and verified by Municipal Treasury Escrow.",
-    transaction: newTxn,
-    summary: computeAdminRevenueSummary(),
-    receipt: {
-      transactionId: newTxn.id,
-      utrNumber: newTxn.transactionRef,
-      invoiceNumber: newTxn.invoiceId,
-      date: newTxn.date,
-      payer: newTxn.payer,
-      payee: newTxn.payee,
-      grossAmount: newTxn.grossAmount,
-      civicPulseEarnings: newTxn.amount,
-      commissionPercent: newTxn.adminCutPercent,
-      paymentMethod: newTxn.paymentMethod,
-      digitalSeal: "GOVT-MAHA-PFMS-VERIFIED-SHA256",
-      status: "Settled & Verified by PFMS Treasury",
-    },
-  });
+// ============================================================
+// ADMIN CONTRACTS
+// ============================================================
+
+app.get(
+  "/api/admin/contracts",
+  (req, res) => {
+    res.json({
+      success: true,
+
+      contracts:
+        adminContracts,
+
+      count:
+        adminContracts.length,
+    });
+  }
+);
+
+// ============================================================
+// SIMULATE PAYMENT
+// ============================================================
+
+app.post(
+  "/api/admin/simulate-payment",
+  (req, res) => {
+    const {
+      streamType = "primary",
+
+      grossAmount = 50000,
+
+      payer =
+        "Municipal Corporation",
+
+      payee =
+        "CivicPulse AI Technologies",
+
+      description = "",
+
+      paymentMethod =
+        "Government Treasury",
+
+      customPercent,
+
+      authorityName =
+        "Public Works Authority",
+    } = req.body;
+
+    const numGross =
+      Math.max(
+        100,
+        Number(
+          grossAmount
+        ) || 50000
+      );
+
+    let civicPulseEarnings =
+      0;
+
+    let adminCutPercent =
+      0;
+
+    let type =
+      "Govt SaaS Management";
+
+    let stream =
+      streamType;
+
+    if (
+      streamType ===
+      "primary"
+    ) {
+      adminCutPercent =
+        100;
+
+      civicPulseEarnings =
+        numGross;
+    } else if (
+      streamType ===
+      "secondary"
+    ) {
+      type =
+        "Worker Transaction Fee";
+
+      adminCutPercent =
+        Number(
+          customPercent
+        ) || 5;
+
+      civicPulseEarnings =
+        Math.round(
+          numGross *
+            (adminCutPercent /
+              100)
+        );
+    } else if (
+      streamType ===
+      "contract_cut"
+    ) {
+      type =
+        "Contract Authority Commission";
+
+      adminCutPercent =
+        Number(
+          customPercent
+        ) || 2.5;
+
+      civicPulseEarnings =
+        Math.round(
+          numGross *
+            (adminCutPercent /
+              100)
+        );
+    }
+
+    const transactionRef =
+      `PFMS/IN/${new Date().getFullYear()}/${Math.floor(
+        100000 +
+          Math.random() *
+            900000
+      )}`;
+
+    const invoiceId =
+      `INV-CP-${new Date().getFullYear()}-${Math.floor(
+        1000 +
+          Math.random() *
+            9000
+      )}`;
+
+    const id =
+      `TXN-CP-${Date.now()
+        .toString()
+        .slice(-6)}`;
+
+    const newTxn = {
+      id,
+
+      type,
+
+      stream,
+
+      description:
+        description ||
+        "CivicPulse payment transaction",
+
+      amount:
+        civicPulseEarnings,
+
+      grossAmount:
+        numGross,
+
+      adminCutPercent,
+
+      payer,
+
+      payee,
+
+      paymentMethod,
+
+      authorityName,
+
+      transactionRef,
+
+      invoiceId,
+
+      date:
+        new Date().toISOString(),
+
+      status:
+        "Settled",
+    };
+
+    adminTransactions.unshift(
+      newTxn
+    );
+
+    res.json({
+      success: true,
+
+      message:
+        "Payment transaction simulated successfully.",
+
+      transaction:
+        newTxn,
+
+      summary:
+        computeAdminRevenueSummary(),
+    });
+  }
+);
+
+// ============================================================
+// AWARD CONTRACT
+// ============================================================
+
+app.post(
+  "/api/admin/award-contract",
+  (req, res) => {
+    const {
+      municipalityName =
+        "Municipal Corporation",
+
+      contractTier =
+        "Municipal Corporation",
+
+      annualValue = 2500000,
+
+      awardedAuthority =
+        "Public Works Division",
+
+      adminCommissionPercent = 2.5,
+
+      serviceScope = [
+        "Infrastructure Upkeep",
+        "AI Quality Auditing",
+      ],
+    } = req.body;
+
+    const numValue =
+      Math.max(
+        10000,
+        Number(
+          annualValue
+        ) || 2500000
+      );
+
+    const numPercent =
+      Number(
+        adminCommissionPercent
+      ) || 2.5;
+
+    const adminCutAmount =
+      Math.round(
+        numValue *
+          (numPercent /
+            100)
+      );
+
+    const contractId =
+      `CON-CP-${Math.floor(
+        1000 +
+          Math.random() *
+            9000
+      )}`;
+
+    const now =
+      new Date();
+
+    const nextYear =
+      new Date(
+        now.getFullYear() + 1,
+        now.getMonth(),
+        now.getDate()
+      );
+
+    const newContract = {
+      id: contractId,
+
+      municipalityName,
+
+      contractTier,
+
+      annualValue:
+        numValue,
+
+      awardedAuthority,
+
+      adminCommissionPercent:
+        numPercent,
+
+      startDate:
+        now
+          .toISOString()
+          .split("T")[0],
+
+      renewalDate:
+        nextYear
+          .toISOString()
+          .split("T")[0],
+
+      status:
+        "Active",
+
+      serviceScope:
+        Array.isArray(
+          serviceScope
+        )
+          ? serviceScope
+          : [serviceScope],
+    };
+
+    adminContracts.unshift(
+      newContract
+    );
+
+    const commissionTxn = {
+      id:
+        `TXN-CP-${Date.now()
+          .toString()
+          .slice(-6)}`,
+
+      type:
+        "Contract Authority Commission",
+
+      stream:
+        "contract_cut",
+
+      description:
+        `Contract administration commission for ${awardedAuthority}`,
+
+      amount:
+        adminCutAmount,
+
+      grossAmount:
+        numValue,
+
+      adminCutPercent:
+        numPercent,
+
+      payer:
+        municipalityName,
+
+      payee:
+        `${awardedAuthority} (Awarded Entity)`,
+
+      paymentMethod:
+        "Government Treasury / Escrow",
+
+      transactionRef:
+        `PFMS/TENDER/${new Date().getFullYear()}/${Math.floor(
+          100000 +
+            Math.random() *
+              900000
+        )}`,
+
+      invoiceId:
+        `INV-CP-${new Date().getFullYear()}-${Math.floor(
+          1000 +
+            Math.random() *
+              9000
+        )}`,
+
+      date:
+        new Date().toISOString(),
+
+      relatedContractId:
+        contractId,
+
+      status:
+        "Settled",
+    };
+
+    adminTransactions.unshift(
+      commissionTxn
+    );
+
+    res.json({
+      success: true,
+
+      message:
+        `Contract ${contractId} created successfully.`,
+
+      contract:
+        newContract,
+
+      commissionTransaction:
+        commissionTxn,
+
+      summary:
+        computeAdminRevenueSummary(),
+    });
+  }
+);
+
+// ============================================================
+// RESET REVENUE
+// ============================================================
+
+app.post(
+  "/api/admin/reset-revenue",
+  (req, res) => {
+    adminContracts = [
+      ...INITIAL_ADMIN_CONTRACTS,
+    ];
+
+    adminTransactions = [
+      ...INITIAL_TRANSACTIONS,
+    ];
+
+    res.json({
+      success: true,
+
+      message:
+        "Admin revenue and contract ledger reset.",
+
+      summary:
+        computeAdminRevenueSummary(),
+    });
+  }
+);
+
+// ============================================================
+// ERROR HANDLER
+// ============================================================
+
+app.use(
+  (
+    err,
+    req,
+    res,
+    next
+  ) => {
+    console.error(
+      "❌ Unhandled server error:"
+    );
+
+    console.error(
+      err?.message ||
+        err
+    );
+
+    res.status(500).json({
+      success: false,
+
+      error:
+        err?.message ||
+        "Internal server error.",
+    });
+  }
+);
+// ============================================================
+// GEMINI API TEST ROUTE
+// ============================================================
+
+app.get("/test-gemini", async (req, res) => {
+  try {
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(500).json({
+        success: false,
+        error: "GEMINI_API_KEY is not configured on Render",
+      });
+    }
+
+    if (!aiClient) {
+      return res.status(500).json({
+        success: false,
+        error: "Gemini client is not initialized",
+      });
+    }
+
+    console.log("🧪 Testing Gemini API...");
+
+    const response = await aiClient.models.generateContent({
+      model: "gemini-3.8-flash",
+      contents: "Reply with exactly: Gemini API is working",
+      config: {
+        temperature: 0,
+      },
+    });
+
+    const text =
+      typeof response.text === "function"
+        ? response.text()
+        : response.text;
+
+    console.log("✅ Gemini test successful:", text);
+
+    return res.json({
+      success: true,
+      model: "gemini-3.8-flash",
+      message: text,
+      status: "GEMINI_WORKING",
+    });
+
+  } catch (error) {
+    console.error(
+      "❌ Gemini test failed:",
+      error?.message || error
+    );
+
+    return res.status(500).json({
+      success: false,
+      error: error?.message || String(error),
+      status: "GEMINI_REQUEST_FAILED",
+    });
+  }
 });
 
-// 5E. POST Award a New Government Contract with CivicPulse Admin Cut
-app.post("/api/admin/award-contract", (req, res) => {
-  const {
-    municipalityName = "Pune Municipal Corporation (PMC)",
-    contractTier = "Municipal Corporation",
-    annualValue = 2500000,
-    awardedAuthority = "PMC Central Roads Division",
-    adminCommissionPercent = 2.5,
-    serviceScope = ["Infrastructure Upkeep", "AI Quality Auditing"],
-  } = req.body;
+// ============================================================
+// START SERVER
+// ============================================================
 
-  const numValue = Math.max(10000, Number(annualValue) || 2500000);
-  const numPercent = Number(adminCommissionPercent) || 2.5;
-  const adminCutAmount = Math.round(numValue * (numPercent / 100));
-
-  const contractId = `CON-CP-${Math.floor(1000 + Math.random() * 9000)}`;
-  const now = new Date();
-  const nextYear = new Date(now.getFullYear() + 1, now.getMonth(), now.getDate());
-
-  const newContract = {
-    id: contractId,
-    municipalityName,
-    contractTier,
-    annualValue: numValue,
-    awardedAuthority,
-    adminCommissionPercent: numPercent,
-    startDate: now.toISOString().split("T")[0],
-    renewalDate: nextYear.toISOString().split("T")[0],
-    status: "Active",
-    serviceScope: Array.isArray(serviceScope) ? serviceScope : [serviceScope],
-  };
-
-  adminContracts.unshift(newContract);
-
-  // Generate the Commission Transaction for CivicPulse Admin
-  const transactionRef = `PFMS/TENDER/${new Date().getFullYear()}/${Math.floor(100000 + Math.random() * 900000)}`;
-  const invoiceId = `INV-CP-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`;
-
-  const commissionTxn = {
-    id: `TXN-CP-${Date.now().toString().slice(-6)}`,
-    type: "Contract Authority Commission",
-    stream: "contract_cut",
-    description: `Tender Award Platform Commission for ${awardedAuthority} (${numPercent}%)`,
-    amount: adminCutAmount,
-    grossAmount: numValue,
-    adminCutPercent: numPercent,
-    payer: municipalityName,
-    payee: `${awardedAuthority} (Awarded Entity)`,
-    paymentMethod: "Treasury Project Escrow Account",
-    transactionRef,
-    invoiceId,
-    date: new Date().toISOString(),
-    relatedContractId: contractId,
-    status: "Settled",
-  };
-
-  adminTransactions.unshift(commissionTxn);
-
-  console.log(`📜 Contract Awarded: ${contractId} to ${awardedAuthority} | Value: ₹${numValue.toLocaleString()} | CivicPulse Cut (${numPercent}%): ₹${adminCutAmount.toLocaleString()}`);
-
-  res.json({
-    success: true,
-    message: `Contract ${contractId} successfully awarded to ${awardedAuthority}. CivicPulse Admin commission of ₹${adminCutAmount.toLocaleString()} credited!`,
-    contract: newContract,
-    commissionTransaction: commissionTxn,
-    summary: computeAdminRevenueSummary(),
-  });
-});
-
-// 5F. POST Reset Admin Revenue to Initial Demo State
-app.post("/api/admin/reset-revenue", (req, res) => {
-  adminContracts = [...INITIAL_ADMIN_CONTRACTS];
-  adminTransactions = [...INITIAL_TRANSACTIONS];
-  res.json({
-    success: true,
-    message: "Admin revenue and contract ledger reset to initial baseline.",
-    summary: computeAdminRevenueSummary(),
-  });
-});
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 CivicPulse AI YOLO Vision Backend running on http://localhost:${PORT}`);
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
